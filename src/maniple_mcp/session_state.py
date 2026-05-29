@@ -430,7 +430,7 @@ def find_jsonl_by_marker(
             # Read first 50KB of file (marker is sent at session start)
             file_size = f.stat().st_size
             read_size = min(file_size, 50000)
-            with open(f, "r") as fp:
+            with open(f, "r", encoding="utf-8") as fp:
                 content = fp.read(read_size)
 
             if any(marker in content for marker in markers):
@@ -524,7 +524,7 @@ def _scan_codex_markers(
     tmux_pane_id: Optional[str] = None,
 ) -> Optional[CodexSessionMatch]:
     try:
-        with open(jsonl_path, "r") as fp:
+        with open(jsonl_path, "r", encoding="utf-8") as fp:
             # Scan line-by-line so we can short-circuit as soon as markers are found.
             for line in fp:
                 if not any(prefix in line for prefix in _ALL_MARKER_PREFIXES):
@@ -689,7 +689,7 @@ def find_jsonl_by_iterm_id(
 
             # Parse JSONL looking for root user message with our markers
             try:
-                with open(f, "r") as fp:
+                with open(f, "r", encoding="utf-8") as fp:
                     for line in fp:
                         line = line.strip()
                         if not line:
@@ -790,7 +790,7 @@ def find_jsonl_by_tmux_id(
 
             # Parse JSONL looking for a user message with our markers
             try:
-                with open(f, "r") as fp:
+                with open(f, "r", encoding="utf-8") as fp:
                     for line in fp:
                         line = line.strip()
                         if not line:
@@ -989,7 +989,7 @@ def parse_session(jsonl_path: Path) -> SessionState:
     session_id = jsonl_path.stem
     project_path = ""
 
-    with open(jsonl_path, "r") as f:
+    with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -1085,7 +1085,7 @@ def parse_codex_session(jsonl_path: Path) -> SessionState:
     session_id = jsonl_path.stem
 
     try:
-        with open(jsonl_path, "r") as f:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
             for line_num, line in enumerate(f):
                 line = line.strip()
                 if not line:
@@ -1335,7 +1335,7 @@ def parse_stop_hook_entries(jsonl_path: Path) -> list[StopHookEntry]:
     entries = []
 
     try:
-        with open(jsonl_path, "r") as f:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -1426,7 +1426,7 @@ def is_session_stopped(
     last_message_ts: Optional[datetime] = None
 
     try:
-        with open(jsonl_path, "r") as f:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:

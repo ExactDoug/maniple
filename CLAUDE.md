@@ -38,7 +38,7 @@ Changes that touch terminal backend code **MUST** include one of:
 ## Project Structure
 
 ```
-src/claude_team_mcp/
+src/maniple_mcp/
 ├── server.py                  # FastMCP server entry point, registers all tools
 ├── registry.py                # Worker tracking (ManagedSession, SessionRegistry)
 ├── session_state.py           # JSONL parsing for Claude conversation logs
@@ -141,7 +141,7 @@ uv sync --group dev
 uv run --group dev pytest
 
 # Run server directly (debugging)
-uv run python -m claude_team_mcp
+uv run python -m maniple_mcp
 ```
 
 ## Pull Requests

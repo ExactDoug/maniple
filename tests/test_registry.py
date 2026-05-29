@@ -7,6 +7,58 @@ from maniple_mcp.registry import (
     SessionRegistry,
     SessionStatus,
 )
+from maniple_mcp.terminal_backends.base import TerminalSession
+
+
+class TestResolveRobustness:
+    """H7: name/terminal-id resolution should be case-insensitive and
+    surface ambiguity instead of silently misrouting."""
+
+    def test_name_resolves_case_insensitively(self):
+        registry = SessionRegistry()
+        registry.add(MagicMock(), "/p", name="Groucho")
+        assert registry.resolve("groucho").name == "Groucho"
+        assert registry.resolve("GROUCHO").name == "Groucho"
+
+    def test_exact_name_preferred_over_case_insensitive(self):
+        registry = SessionRegistry()
+        registry.add(MagicMock(), "/p", name="harpo")
+        registry.add(MagicMock(), "/p", name="Harpo")
+        # Exact match wins over the case-insensitive fallback.
+        assert registry.resolve("Harpo").name == "Harpo"
+        assert registry.resolve("harpo").name == "harpo"
+
+    def test_duplicate_exact_name_is_ambiguous_returns_none(self):
+        # A command-routing lookup must not guess between identically-named
+        # workers; it returns None so the caller disambiguates by ID.
+        registry = SessionRegistry()
+        registry.add(MagicMock(), "/p", name="Zeppo")
+        registry.add(MagicMock(), "/p", name="Zeppo")
+        assert registry.get_by_name("Zeppo") is None
+
+    def test_ambiguous_case_insensitive_returns_none(self):
+        registry = SessionRegistry()
+        registry.add(MagicMock(), "/p", name="harpo")
+        registry.add(MagicMock(), "/p", name="Harpo")
+        # "HARPO" matches neither exactly; case-insensitively it matches both,
+        # so resolution refuses to guess.
+        assert registry.resolve("HARPO") is None
+        # ...but the exact spellings still resolve unambiguously.
+        assert registry.resolve("harpo").name == "harpo"
+        assert registry.resolve("Harpo").name == "Harpo"
+
+    def test_terminal_id_resolves_case_insensitively(self):
+        registry = SessionRegistry()
+        handle = TerminalSession(backend_id="iterm", native_id="ABC-123", handle=None)
+        session = registry.add(handle, "/p", name="W")
+        # Terminal IDs (iTerm UUIDs) may arrive in either case.
+        assert registry.resolve("iterm:abc-123") is session
+        assert registry.resolve("iterm:ABC-123") is session
+
+    def test_unknown_identifier_returns_none(self):
+        registry = SessionRegistry()
+        registry.add(MagicMock(), "/p", name="Chico")
+        assert registry.resolve("nobody") is None
 
 
 class TestSessionRegistryBasics:

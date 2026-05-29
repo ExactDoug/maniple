@@ -7,6 +7,7 @@ our session IDs, terminal session handles, and Claude JSONL session IDs.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -23,6 +24,8 @@ from .session_state import (
     parse_session,
 )
 from .terminal_backends import TerminalBackend, TerminalSession
+
+logger = logging.getLogger("maniple")
 
 # Type alias for supported agent types
 AgentType = Literal["claude", "codex"]
@@ -500,15 +503,42 @@ class SessionRegistry:
         """
         Get a session by its friendly name.
 
+        Matching prefers an exact (case-sensitive) name, then falls back to a
+        case-insensitive match so a coordinator typing "groucho" still resolves
+        "Groucho".
+
+        This is a command-routing lookup, so it refuses to GUESS: if a name is
+        ambiguous (more than one session matches at the level it matched), it
+        logs a warning and returns None rather than silently routing to the
+        wrong worker. The caller must disambiguate with an internal/terminal ID.
+
         Args:
             name: The session name to look up
 
         Returns:
-            ManagedSession if found, None otherwise
+            ManagedSession if exactly one session matches, else None.
         """
-        for session in self._sessions.values():
-            if session.name == name:
-                return session
+        exact = [s for s in self._sessions.values() if s.name == name]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            logger.warning(
+                "Ambiguous worker name %r matches %d sessions exactly; refusing to "
+                "guess. Use the internal ID or terminal ID to disambiguate.",
+                name, len(exact),
+            )
+            return None
+
+        name_lower = name.lower()
+        ci = [s for s in self._sessions.values() if s.name and s.name.lower() == name_lower]
+        if len(ci) == 1:
+            return ci[0]
+        if len(ci) > 1:
+            logger.warning(
+                "Ambiguous worker name %r (case-insensitive) matches %d sessions; "
+                "refusing to guess. Use the internal ID or terminal ID to disambiguate.",
+                name, len(ci),
+            )
         return None
 
     def resolve(self, identifier: str) -> Optional[ManagedSession]:
@@ -534,12 +564,14 @@ class SessionRegistry:
         if identifier in self._sessions:
             return self._sessions[identifier]
 
-        # 2. Try terminal ID (e.g., "iterm:UUID")
+        # 2. Try terminal ID (e.g., "iterm:UUID"). Compare case-insensitively
+        #    since terminal IDs (e.g. iTerm UUIDs) may arrive in either case.
+        identifier_lower = identifier.lower()
         for session in self._sessions.values():
-            if session.terminal_id and str(session.terminal_id) == identifier:
+            if session.terminal_id and str(session.terminal_id).lower() == identifier_lower:
                 return session
 
-        # 3. Try name (last resort)
+        # 3. Try name (exact, then case-insensitive — last resort)
         return self.get_by_name(identifier)
 
     def list_all(self) -> list[AnySession]:
