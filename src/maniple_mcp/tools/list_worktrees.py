@@ -158,6 +158,11 @@ def register_tools(mcp: FastMCP) -> None:
                                 f"Refusing unsafe orphan removal for {orphan_path}: {e}"
                             )
                         except Exception as e:
+                            # Keep the response contract consistent: a non-removed
+                            # orphan is always reflected via removal_skipped +
+                            # skipped_count, not just a log line.
+                            wt_info["removal_skipped"] = "error"
+                            skipped_count += 1
                             logger.warning(
                                 f"Failed to remove orphaned worktree {orphan_path}: {e}"
                             )
