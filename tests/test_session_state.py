@@ -15,7 +15,30 @@ from maniple_mcp.session_state import (
     find_jsonl_by_iterm_id,
     find_jsonl_by_tmux_id,
     generate_marker_message,
+    parse_session,
 )
+
+
+class TestUtf8Parsing:
+    """JSONL logs are read as UTF-8 regardless of platform default encoding."""
+
+    def test_non_ascii_content_round_trips(self, tmp_path):
+        jsonl = tmp_path / "sess.jsonl"
+        entry = {
+            "type": "message",
+            "uuid": "u1",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "héllo 🤖 wörld"}],
+            },
+        }
+        # Written as UTF-8; on Windows the default open() encoding (cp1252)
+        # would otherwise corrupt or fail to read these bytes.
+        jsonl.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+
+        state = parse_session(jsonl)
+        assert len(state.messages) == 1
+        assert state.messages[0].content == "héllo 🤖 wörld"
 
 
 class TestMarkerConstants:
