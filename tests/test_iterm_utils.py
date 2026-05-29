@@ -100,6 +100,48 @@ class TestClaudeCommandBuilding:
             assert claude_cmd == "happy --dangerously-skip-permissions"
 
 
+class TestStartAgentQuoting:
+    """
+    MAN-SEC-001 (iTerm side): the launch command must shell-quote project_path
+    and output_capture_path. Mirrors the tmux test in test_tmux_backend.py
+    (backend parity).
+    """
+
+    @pytest.mark.asyncio
+    async def test_start_agent_quotes_project_path_and_capture(self, monkeypatch):
+        import maniple_mcp.iterm_utils as iu
+        from maniple_mcp.cli_backends import claude_cli
+
+        sent = {}
+
+        async def fake_shell_ready(session, timeout_seconds=10.0):
+            return True
+
+        async def fake_agent_ready(session, cli, timeout_seconds=30.0):
+            return True
+
+        async def fake_send_prompt(session, cmd):
+            sent["cmd"] = cmd
+
+        monkeypatch.setattr(iu, "wait_for_shell_ready", fake_shell_ready)
+        monkeypatch.setattr(iu, "wait_for_agent_ready", fake_agent_ready)
+        monkeypatch.setattr(iu, "send_prompt", fake_send_prompt)
+
+        evil_path = "/tmp/proj; touch pwned"
+        evil_capture = "/tmp/cap;rm -rf x"
+        await iu.start_agent_in_session(
+            session=object(),  # unused once the helpers above are stubbed
+            cli=claude_cli,
+            project_path=evil_path,
+            output_capture_path=evil_capture,
+        )
+
+        cmd = sent["cmd"]
+        assert "cd /tmp/proj; touch pwned &&" not in cmd
+        assert "'/tmp/proj; touch pwned'" in cmd
+        assert "'/tmp/cap;rm -rf x'" in cmd
+
+
 class TestBuildStopHookSettingsFile:
     """Tests for the stop hook settings file builder."""
 

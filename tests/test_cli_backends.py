@@ -181,6 +181,94 @@ class TestClaudeCLI:
             assert cmd.endswith("claude")
 
 
+class TestBuildFullCommandInjectionSafety:
+    """
+    Security: build_full_command is the shared command builder used by BOTH the
+    iTerm and tmux backends. It must shell-escape every interpolated value so an
+    attacker-influenced input cannot inject shell syntax (MAN-SEC-001).
+    """
+
+    def _claude(self):
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("MANIPLE_COMMAND", None)
+            os.environ.pop("CLAUDE_TEAM_COMMAND", None)
+            return ClaudeCLI()
+
+    def test_malicious_env_value_is_quoted(self):
+        """An env value with shell metacharacters must survive as one literal token."""
+        import shlex
+
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("MANIPLE_COMMAND", None)
+            os.environ.pop("CLAUDE_TEAM_COMMAND", None)
+            cli = ClaudeCLI()
+            cmd = cli.build_full_command(env_vars={"EVIL": "x; rm -rf /"})
+            # A POSIX shell parser sees the assignment as a single token — the
+            # ';' is literal data, not a command separator.
+            tokens = shlex.split(cmd)
+            assert "EVIL=x; rm -rf /" in tokens
+            assert "claude" in tokens
+
+    def test_malicious_plugin_dir_is_quoted(self):
+        """A plugin_dir with command substitution must be a single literal token."""
+        import shlex
+
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("MANIPLE_COMMAND", None)
+            os.environ.pop("CLAUDE_TEAM_COMMAND", None)
+            cli = ClaudeCLI()
+            cmd = cli.build_full_command(plugin_dir="/tmp/$(touch pwned)")
+            tokens = shlex.split(cmd)
+            # The substitution survives verbatim as one argument → not evaluated.
+            assert tokens == ["claude", "--plugin-dir", "/tmp/$(touch pwned)"]
+
+    def test_benign_flags_pass_through_unchanged(self):
+        """Flags without metacharacters should not gain spurious quoting."""
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("MANIPLE_COMMAND", None)
+            os.environ.pop("CLAUDE_TEAM_COMMAND", None)
+            cli = ClaudeCLI()
+            cmd = cli.build_full_command(dangerously_skip_permissions=True)
+            assert cmd == "claude --dangerously-skip-permissions"
+
+    def test_malicious_command_override_is_neutralized(self):
+        """A command override carrying ';' must not inject a second command."""
+        import shlex
+
+        with patch.dict(os.environ, {"MANIPLE_COMMAND": "claude; touch /tmp/pwned #"}):
+            cli = ClaudeCLI()
+            cmd = cli.build_full_command()
+            # Parsed by a POSIX shell, the override tokenizes to literal command
+            # name + args — the ';' is data inside a token, never a separator.
+            tokens = shlex.split(cmd)
+            assert tokens[0] == "claude;"  # harmless: "command not found"
+            assert "touch" in tokens  # present, but as a literal arg, not a command
+            # The rendered string must quote the ';' so a shell cannot split on it.
+            assert "'claude;'" in cmd
+
+    def test_multi_token_command_override_preserved(self):
+        """A legitimate multi-token override (wrapper + subcommand) still works."""
+        import shlex
+
+        with patch.dict(os.environ, {"MANIPLE_COMMAND": "my-wrapper run"}):
+            cli = ClaudeCLI()
+            cmd = cli.build_full_command(dangerously_skip_permissions=True)
+            assert shlex.split(cmd) == [
+                "my-wrapper",
+                "run",
+                "--dangerously-skip-permissions",
+            ]
+
+    def test_invalid_env_key_rejected(self):
+        """An env var name with shell metacharacters must be rejected."""
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop("MANIPLE_COMMAND", None)
+            os.environ.pop("CLAUDE_TEAM_COMMAND", None)
+            cli = ClaudeCLI()
+            with pytest.raises(ValueError):
+                cli.build_full_command(env_vars={"BAD; touch x #": "1"})
+
+
 class TestCodexCLI:
     """Tests for Codex CLI backend."""
 

@@ -19,7 +19,9 @@ Two worktree strategies are supported:
 """
 
 import hashlib
+import os
 import re
+import stat
 import subprocess
 import time
 import uuid
@@ -123,6 +125,135 @@ class WorktreeError(Exception):
     """Raised when a git worktree operation fails."""
 
     pass
+
+
+def _safe_path_component(value: str, *, field: str) -> str:
+    """
+    Validate that ``value`` is safe to use as a single filesystem path component.
+
+    Guards against path traversal: rejects values containing path separators,
+    parent references (``..``), null bytes, or absolute paths. This prevents an
+    attacker-influenced identifier (e.g. ``issue_id``) from escaping the
+    intended ``.worktrees/`` directory.
+
+    Args:
+        value: The candidate path component.
+        field: Name of the source field, used in error messages.
+
+    Returns:
+        The validated value (unchanged).
+
+    Raises:
+        WorktreeError: If the value is not a single safe path component.
+    """
+    if not value or value in (".", ".."):
+        raise WorktreeError(f"Invalid {field}: {value!r} is not a usable path component")
+    if "/" in value or "\\" in value or "\x00" in value:
+        raise WorktreeError(
+            f"Invalid {field}: {value!r} must not contain path separators"
+        )
+    # Path.name strips any directory portion; if it differs, the value was not a
+    # plain single component (catches absolute paths and other surprises).
+    if Path(value).is_absolute() or Path(value).name != value:
+        raise WorktreeError(
+            f"Invalid {field}: {value!r} must be a single path component"
+        )
+    return value
+
+
+def _rmtree_at(dir_fd: int, name: str) -> None:
+    """
+    Recursively remove ``name`` located in the directory referenced by ``dir_fd``,
+    without following symlinks at any level.
+
+    Every operation is performed relative to a file descriptor opened with
+    ``O_NOFOLLOW``/``O_DIRECTORY``, so once the top directory's inode is pinned a
+    later swap of any ancestor *pathname* (a TOCTOU symlink race) cannot redirect
+    the deletion to a different location. A symlink encountered as an entry is
+    unlinked, never traversed.
+    """
+    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if stat.S_ISDIR(st.st_mode):
+        sub_fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dir_fd
+        )
+        try:
+            for entry in os.listdir(sub_fd):
+                _rmtree_at(sub_fd, entry)
+        finally:
+            os.close(sub_fd)
+        os.rmdir(name, dir_fd=dir_fd)
+    else:
+        os.unlink(name, dir_fd=dir_fd)
+
+
+def remove_orphan_dir_safely(parent_dir: Path, name: str) -> None:
+    """
+    Delete a child directory ``name`` under ``parent_dir`` without ever following
+    a symlink for ``parent_dir`` or any component below it.
+
+    This is the TOCTOU-safe replacement for ``shutil.rmtree(parent_dir / name)``:
+    ``parent_dir`` is opened with ``O_NOFOLLOW`` (raising if it is/became a
+    symlink), pinning its real inode; the removal then runs relative to that
+    descriptor so a parent-symlink swap cannot escape ``parent_dir``.
+
+    Raises:
+        WorktreeError: If ``parent_dir`` is a symlink, ``name`` is not a single
+            path component, or the platform lacks ``dir_fd`` support.
+    """
+    if Path(name).name != name or name in (".", ".."):
+        raise WorktreeError(f"Refusing to remove unsafe orphan name: {name!r}")
+    # os.{stat,unlink,rmdir,open} use the dir_fd= parameter (supports_dir_fd);
+    # os.listdir takes the fd directly as its path (supports_fd).
+    if not {os.stat, os.unlink, os.rmdir, os.open}.issubset(os.supports_dir_fd) or (
+        os.listdir not in os.supports_fd
+    ):
+        raise WorktreeError(
+            "Platform lacks dir_fd support required for safe worktree removal"
+        )
+    try:
+        parent_fd = os.open(
+            parent_dir, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+        )
+    except OSError as e:
+        raise WorktreeError(
+            f"Refusing to remove orphan under {parent_dir}: {e}"
+        ) from e
+    try:
+        _rmtree_at(parent_fd, name)
+    finally:
+        os.close(parent_fd)
+
+
+def worktree_has_changes(worktree_path: Path) -> bool:
+    """
+    Return True if a worktree has uncommitted or untracked changes.
+
+    Uses ``git status --porcelain`` scoped to the worktree. A non-empty result
+    means there is work that would be lost if the worktree were force-removed.
+    On any error (e.g. the directory is not a git worktree), returns True
+    conservatively so callers default to preserving the directory.
+
+    Args:
+        worktree_path: Path to the worktree to inspect.
+
+    Returns:
+        True if the worktree is dirty (or its state cannot be determined),
+        False only when git confirms a clean working tree.
+    """
+    worktree_path = Path(worktree_path).resolve()
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(worktree_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
 
 
 def get_repo_hash(repo_path: Path) -> str:
@@ -330,6 +461,10 @@ def create_local_worktree(
 
     # Build the worktree directory name
     if issue_id:
+        # issue_id is used directly as (part of) a path component, so validate
+        # it cannot contain separators or traversal sequences. badge is already
+        # sanitized via short_slug().
+        issue_id = _safe_path_component(issue_id, field="issue_id")
         # Issue-based naming: {issue_id}-{badge}
         if badge:
             dir_name = f"{issue_id}-{short_slug(badge)}"
@@ -346,6 +481,16 @@ def create_local_worktree(
 
     # Worktree path inside the repo
     worktrees_dir = repo_path / LOCAL_WORKTREE_DIR
+
+    # Reject a symlinked .worktrees root. A symlink here would let the later
+    # is_relative_to() containment check pass (both sides resolve through the
+    # link) while git actually writes outside the repository, and would let
+    # orphan cleanup rmtree() through the link. .worktrees must be a real dir.
+    if worktrees_dir.is_symlink():
+        raise WorktreeError(
+            f".worktrees must be a real directory inside the repo, not a "
+            f"symlink: {worktrees_dir}"
+        )
 
     # Ensure .worktrees is in .gitignore
     ensure_gitignore_entry(repo_path, LOCAL_WORKTREE_DIR)
@@ -383,6 +528,15 @@ def create_local_worktree(
             worktree_path = worktrees_dir / dir_name
         branch_name = dir_name
 
+    # Defense in depth: ensure the final path is still inside the repo before we
+    # ask git to create anything. Anchored on the (already-resolved, real)
+    # repo_path rather than worktrees_dir — resolving worktrees_dir would follow
+    # a symlink swapped in for .worktrees and defeat the check.
+    if not worktree_path.resolve().is_relative_to(repo_path):
+        raise WorktreeError(
+            f"Refusing to create worktree outside repo {repo_path}: {worktree_path}"
+        )
+
     resolved_base = None
     if base:
         resolved_base = _resolve_worktree_base(repo_path, base)
@@ -398,13 +552,25 @@ def create_local_worktree(
     if result.returncode != 0:
         raise WorktreeError(f"Failed to create local worktree: {result.stderr.strip()}")
 
+    # Post-creation containment: catch a symlink swapped in AFTER the is_symlink()
+    # check but BEFORE git ran (TOCTOU). If the worktree landed outside the repo,
+    # fail loudly. We deliberately do NOT attempt a path-based `git worktree
+    # remove` rollback here: the swapped parent symlink would make that rollback
+    # delete OUTSIDE the repo. Leaving a stray directory is far safer than
+    # performing an out-of-repo deletion; the operator can remove it manually.
+    if not worktree_path.resolve().is_relative_to(repo_path):
+        raise WorktreeError(
+            f"Worktree was created outside repo {repo_path} (symlink race?): "
+            f"{worktree_path.resolve()}. Left in place; remove it manually."
+        )
+
     return worktree_path
 
 
 def remove_worktree(
     repo_path: Path,
     worktree_path: Path,
-    force: bool = True,
+    force: bool = False,
 ) -> bool:
     """
     Remove a worktree directory (does NOT delete the branch).
@@ -412,10 +578,15 @@ def remove_worktree(
     The branch is intentionally kept alive so that commits can be
     cherry-picked before manual cleanup.
 
+    By default (``force=False``) git refuses to remove a worktree that has
+    uncommitted or untracked changes, so callers must opt in to discarding
+    work. Use :func:`worktree_has_changes` to check before forcing.
+
     Args:
         repo_path: Path to the main repository
         worktree_path: Full path to the worktree to remove
         force: If True, force removal even with uncommitted changes
+            (DESTRUCTIVE — discards uncommitted work)
 
     Returns:
         True if worktree was successfully removed
