@@ -152,15 +152,20 @@ async def detect_appearance_mode(connection: "ItermConnection") -> str:
     try:
         from iterm2.app import async_get_app
 
-        # Get the app object to query effective theme
-        app = await async_get_app(connection)
+        from .iterm_utils import _io
+
+        # Get the app object to query effective theme (timeout-guarded so an
+        # unresponsive iTerm2 can't hang the spawn path).
+        app = await _io(async_get_app(connection), what="get_app(appearance)")
         if app is None:
             logger.warning("Could not get iTerm2 app, defaulting to dark")
             return "dark"
 
         # iTerm2's effective_theme returns a list of theme components
         # Common values include 'dark', 'light', 'automatic'
-        theme = await app.async_get_variable("effectiveTheme")
+        theme = await _io(
+            app.async_get_variable("effectiveTheme"), what="get_effectiveTheme"
+        )
 
         if theme and isinstance(theme, str):
             # effectiveTheme is a string like "dark" or "light"
@@ -227,8 +232,12 @@ async def get_or_create_profile(connection: "ItermConnection") -> str:
     from iterm2.profile import LocalWriteOnlyProfile as LWOProfile
     from iterm2.profile import PartialProfile
 
+    from .iterm_utils import _io
+
     # Get all existing profiles
-    all_profiles = await PartialProfile.async_query(connection)
+    all_profiles = await _io(
+        PartialProfile.async_query(connection), what="profile_query"
+    )
     profile_names = [p.name for p in all_profiles if p.name]
 
     # Check if our profile already exists

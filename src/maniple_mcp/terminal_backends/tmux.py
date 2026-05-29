@@ -20,6 +20,11 @@ if TYPE_CHECKING:
     from ..cli_backends import AgentCLI
 
 
+# Hard timeout (seconds) for every tmux invocation. Prevents a hung/wedged tmux
+# from blocking the spawn/close/list pipeline indefinitely.
+TMUX_SUBPROCESS_TIMEOUT = 30
+
+
 KEY_MAP: dict[str, str] = {
     "enter": "C-m",
     "return": "C-m",
@@ -544,7 +549,12 @@ class TmuxBackend(TerminalBackend):
         )
 
     async def _run_tmux(self, args: list[str]) -> str:
-        """Run a tmux command and return stdout."""
+        """Run a tmux command and return stdout.
+
+        The inner subprocess carries a hard timeout so a hung tmux process is
+        actually killed (wrapping only the awaitable would orphan the process).
+        A timeout surfaces as a RuntimeError rather than blocking the pipeline.
+        """
         cmd = ["tmux"]
         if self._socket_path:
             cmd.extend(["-S", self._socket_path])
@@ -556,9 +566,16 @@ class TmuxBackend(TerminalBackend):
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=TMUX_SUBPROCESS_TIMEOUT,
             )
 
-        result = await asyncio.to_thread(_run)
+        try:
+            result = await asyncio.to_thread(_run)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"tmux command timed out after {TMUX_SUBPROCESS_TIMEOUT}s: "
+                f"{' '.join(args)}"
+            ) from e
         return result.stdout.strip()
 
     def _compute_paste_delay(self, text: str) -> float:

@@ -103,8 +103,10 @@ class ItermBackend(TerminalBackend):
         if tab is None or tab.current_session is None:
             raise RuntimeError("Failed to get initial iTerm2 session from window")
         if name:
+            from ..iterm_utils import _io
+
             try:
-                await tab.async_set_title(name)
+                await _io(tab.async_set_title(name), what="set_tab_title")
             except Exception:
                 pass
         return self.wrap_session(tab.current_session)
@@ -239,10 +241,14 @@ class ItermBackend(TerminalBackend):
 
     async def activate_app(self) -> None:
         """Bring the terminal application to the foreground."""
-        await self._app.async_activate()
+        from ..iterm_utils import _io
+
+        await _io(self._app.async_activate(), what="activate_app")
 
     async def activate_window_for_handle(self, handle: TerminalSession) -> None:
         """Activate the window containing the given terminal session."""
+        from ..iterm_utils import _io
+
         native_session = self.unwrap_session(handle)
         tab = native_session.tab
         if tab is None:
@@ -250,4 +256,4 @@ class ItermBackend(TerminalBackend):
         window = tab.window
         if window is None:
             return
-        await window.async_activate()
+        await _io(window.async_activate(), what="activate_window_for_handle")

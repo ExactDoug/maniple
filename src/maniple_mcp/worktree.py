@@ -32,6 +32,11 @@ from typing import Optional
 # Local worktree directory name within repos
 LOCAL_WORKTREE_DIR = ".worktrees"
 
+# Hard timeout (seconds) for every git subprocess call. Without this a hung git
+# operation (network, locked index, unresponsive filesystem) would block the
+# entire spawn/close pipeline indefinitely.
+GIT_SUBPROCESS_TIMEOUT = 30
+
 
 def slugify(text: str) -> str:
     """
@@ -125,6 +130,41 @@ class WorktreeError(Exception):
     """Raised when a git worktree operation fails."""
 
     pass
+
+
+def _run_git(
+    args: list[str],
+    *,
+    timeout: int = GIT_SUBPROCESS_TIMEOUT,
+) -> subprocess.CompletedProcess[str]:
+    """
+    Run a git command with a hard timeout, capturing output.
+
+    Centralizes the timeout so a hung git process can never block the caller
+    indefinitely. A timeout is surfaced as a WorktreeError (the process is
+    killed by subprocess.run before TimeoutExpired is raised).
+
+    Args:
+        args: Full argv (e.g. ["git", "-C", repo, "worktree", "list"]).
+        timeout: Seconds before the process is killed.
+
+    Returns:
+        The completed process (caller inspects returncode/stdout/stderr).
+
+    Raises:
+        WorktreeError: If the command does not complete within ``timeout``.
+    """
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise WorktreeError(
+            f"git command timed out after {timeout}s: {' '.join(map(str, args))}"
+        ) from e
 
 
 def _safe_path_component(value: str, *, field: str) -> str:
@@ -344,10 +384,8 @@ def create_worktree(
 
     if branch:
         # Check if branch exists
-        branch_check = subprocess.run(
+        branch_check = _run_git(
             ["git", "-C", str(repo_path), "rev-parse", "--verify", f"refs/heads/{branch}"],
-            capture_output=True,
-            text=True,
         )
 
         if branch_check.returncode == 0:
@@ -360,7 +398,7 @@ def create_worktree(
         # No branch specified, create detached HEAD
         cmd.extend(["--detach", str(worktree_path)])
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run_git(cmd)
 
     if result.returncode != 0:
         raise WorktreeError(f"Failed to create worktree: {result.stderr.strip()}")
@@ -371,10 +409,8 @@ def create_worktree(
 def _resolve_worktree_base(repo_path: Path, base: str) -> str:
     # Resolve base ref to a commit hash to avoid worktree-locked branch refs.
     def _rev_parse(ref: str) -> Optional[str]:
-        result = subprocess.run(
+        result = _run_git(
             ["git", "-C", str(repo_path), "rev-parse", "--verify", ref],
-            capture_output=True,
-            text=True,
         )
         if result.returncode == 0:
             return result.stdout.strip()
@@ -502,10 +538,8 @@ def create_local_worktree(
     # Check both path existence and branch existence (git won't allow the same
     # branch checked out in multiple worktrees).
     def branch_exists(name: str) -> bool:
-        result = subprocess.run(
+        result = _run_git(
             ["git", "-C", str(repo_path), "rev-parse", "--verify", f"refs/heads/{name}"],
-            capture_output=True,
-            text=True,
         )
         return result.returncode == 0
 
@@ -547,7 +581,7 @@ def create_local_worktree(
     if resolved_base:
         cmd.append(resolved_base)
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run_git(cmd)
 
     if result.returncode != 0:
         raise WorktreeError(f"Failed to create local worktree: {result.stderr.strip()}")
@@ -610,7 +644,7 @@ def remove_worktree(
 
     cmd.append(str(worktree_path))
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = _run_git(cmd)
 
     if result.returncode != 0:
         # Check if worktree doesn't exist (not an error)
@@ -618,12 +652,12 @@ def remove_worktree(
             return True
         raise WorktreeError(f"Failed to remove worktree: {result.stderr.strip()}")
 
-    # Also run prune to clean up stale worktree references
-    subprocess.run(
-        ["git", "-C", str(repo_path), "worktree", "prune"],
-        capture_output=True,
-        text=True,
-    )
+    # Also run prune to clean up stale worktree references. Best-effort: a prune
+    # timeout must not fail an already-successful removal.
+    try:
+        _run_git(["git", "-C", str(repo_path), "worktree", "prune"])
+    except WorktreeError:
+        pass
 
     return True
 
@@ -656,10 +690,8 @@ def list_git_worktrees(repo_path: Path) -> list[dict]:
     """
     repo_path = Path(repo_path).resolve()
 
-    result = subprocess.run(
+    result = _run_git(
         ["git", "-C", str(repo_path), "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
     )
 
     if result.returncode != 0:
