@@ -445,6 +445,20 @@ class SessionRegistry:
 
     Also tracks RecoveredSession objects from event log recovery, which
     represent sessions discovered from persisted events after MCP restart.
+
+    Concurrency invariant:
+        These mutating/reading methods are **synchronous**, so under the
+        server's single-threaded asyncio event loop each runs to completion
+        without yielding — no other coroutine can observe a half-updated
+        registry or mutate a dict mid-iteration. That is what keeps shared
+        access safe today *without* explicit locks.
+
+        If you ever (a) add an ``await`` inside one of these methods, or
+        (b) dispatch registry access from multiple threads
+        (``run_in_executor`` / ``to_thread``), this invariant breaks and you
+        MUST add an ``asyncio.Lock`` (and snapshot dicts before iterating).
+        The async ``prune_stale_recovered_sessions`` already snapshots before
+        awaiting for exactly this reason.
     """
 
     def __init__(self):
@@ -586,8 +600,10 @@ class SessionRegistry:
             List of all session objects (ManagedSession and RecoveredSession)
         """
         result: list[AnySession] = list(self._sessions.values())
-        # Add recovered sessions not shadowed by live sessions.
-        for session_id, recovered in self._recovered_sessions.items():
+        # Add recovered sessions not shadowed by live sessions. Snapshot the
+        # dict (list(...)) so this stays correct even if a future change makes
+        # the method yield mid-iteration (see class concurrency invariant).
+        for session_id, recovered in list(self._recovered_sessions.items()):
             if session_id not in self._sessions:
                 result.append(recovered)
         return result
@@ -606,8 +622,9 @@ class SessionRegistry:
             List of matching session objects (ManagedSession and RecoveredSession)
         """
         result: list[AnySession] = [s for s in self._sessions.values() if s.status == status]
-        # Add recovered sessions not shadowed by live sessions.
-        for session_id, recovered in self._recovered_sessions.items():
+        # Add recovered sessions not shadowed by live sessions. Snapshot the
+        # dict (see list_all / class concurrency invariant).
+        for session_id, recovered in list(self._recovered_sessions.items()):
             if session_id not in self._sessions and recovered.status == status:
                 result.append(recovered)
         return result
