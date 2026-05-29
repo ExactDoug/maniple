@@ -26,7 +26,7 @@ from ..registry import SessionStatus
 from ..terminal_backends import ItermBackend, MAX_PANES_PER_TAB
 from ..utils import HINTS, error_response, get_env_with_fallback, get_worktree_tracker_dir
 from ..worker_prompt import generate_worker_prompt, get_coordinator_guidance
-from ..worktree import WorktreeError, create_local_worktree
+from ..worktree import WorktreeError, create_local_worktree, remove_worktree
 
 logger = logging.getLogger("maniple")
 
@@ -255,6 +255,46 @@ def register_tools(mcp: FastMCP, ensure_connection) -> None:
         # Ensure we have a fresh backend connection/state
         backend = await ensure_connection(app_ctx)
 
+        # Resources created during a spawn attempt. On any failure these are
+        # rolled back (C2/H4) so a failed spawn_workers leaves no orphaned
+        # panes, worktrees, or registry entries. Initialized before the try so
+        # they are always bound in the failure handlers.
+        worktree_paths: dict[int, Path] = {}  # index -> worktree path
+        main_repo_paths: dict[int, Path] = {}  # index -> main repo
+        pane_sessions: list = []  # terminal handles created this spawn
+        registered_session_ids: list[str] = []  # registry entries added
+
+        async def _rollback_partial_spawn() -> None:
+            """Best-effort teardown of everything created during a failed spawn."""
+            # Registry entries first (so list_workers stops reporting them).
+            for sid in registered_session_ids:
+                try:
+                    registry.remove(sid)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(f"Rollback: failed to remove registry entry {sid}: {exc}")
+            # Terminal panes/windows.
+            for pane in pane_sessions:
+                try:
+                    await backend.close_session(pane, force=True)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(f"Rollback: failed to close pane {pane}: {exc}")
+            # Worktrees. Use force=False: a worker may already have started and
+            # made uncommitted changes by the time a LATER step fails, and that
+            # work must not be silently discarded (same data-safety guarantee as
+            # close_workers). A freshly-created, still-clean worktree is removed;
+            # a dirty one is refused by git and left in place (logged below).
+            for idx, wt_path in worktree_paths.items():
+                repo = main_repo_paths.get(idx)
+                if repo is None:
+                    continue
+                try:
+                    remove_worktree(repo_path=repo, worktree_path=wt_path, force=False)
+                except Exception as exc:
+                    logger.warning(
+                        f"Rollback: preserved worktree {wt_path} "
+                        f"(could not remove cleanly): {exc}"
+                    )
+
         try:
             # Get base session index for color generation
             base_index = registry.count()
@@ -281,9 +321,8 @@ def register_tools(mcp: FastMCP, ensure_connection) -> None:
                     resolved_names.append(next(auto_name_iter))
 
             # Resolve project paths and create worktrees if needed
+            # (worktree_paths / main_repo_paths are declared above for rollback)
             resolved_paths: list[str] = []
-            worktree_paths: dict[int, Path] = {}  # index -> worktree path
-            main_repo_paths: dict[int, Path] = {}  # index -> main repo
             worktree_warnings: list[str] = []
 
             # Get MANIPLE_PROJECT_DIR for "auto" paths (fallback: CLAUDE_TEAM_PROJECT_DIR).
@@ -313,6 +352,7 @@ def register_tools(mcp: FastMCP, ensure_connection) -> None:
                     elif isinstance(worktree_config, bool):
                         use_worktree = worktree_config
                     else:
+                        await _rollback_partial_spawn()
                         return error_response(
                             f"Worker {i} has invalid 'worktree' configuration",
                             hint="Expected a dict with optional 'branch'/'base' fields or a boolean.",
@@ -323,6 +363,7 @@ def register_tools(mcp: FastMCP, ensure_connection) -> None:
                     if env_project_dir:
                         repo_path = Path(env_project_dir).resolve()
                     else:
+                        await _rollback_partial_spawn()
                         return error_response(
                             "project_path='auto' requires MANIPLE_PROJECT_DIR",
                             hint=(
@@ -334,6 +375,7 @@ def register_tools(mcp: FastMCP, ensure_connection) -> None:
                 else:
                     repo_path = Path(project_path).expanduser().resolve()
                     if not repo_path.is_dir():
+                        await _rollback_partial_spawn()
                         return error_response(
                             f"Project path does not exist for worker {i}: {repo_path}",
                             hint=HINTS["project_path_missing"],
@@ -360,6 +402,9 @@ def register_tools(mcp: FastMCP, ensure_connection) -> None:
                             "Using repo directly."
                         )
                         if worktree_explicitly_requested:
+                            # Roll back any worktrees already created for earlier
+                            # workers in this batch before bailing out.
+                            await _rollback_partial_spawn()
                             return error_response(
                                 warning_message,
                                 hint=(
@@ -422,9 +467,10 @@ def register_tools(mcp: FastMCP, ensure_connection) -> None:
 
                     profile_customizations.append(customization)
 
-            # Create panes based on layout mode
-            pane_sessions: list = []  # list of terminal handles
-
+            # Create panes based on layout mode.
+            # (pane_sessions is declared above for rollback; layout branches that
+            # build it all-at-once reassign it, which the rollback handler reads
+            # via the latest binding.)
             if backend.backend_id == "tmux":
                 for i in range(worker_count):
                     pane_sessions.append(
@@ -705,6 +751,7 @@ def register_tools(mcp: FastMCP, ensure_connection) -> None:
                     name=resolved_names[i],
                     session_id=session_ids[i],
                 )
+                registered_session_ids.append(managed.session_id)
                 # Set badge text from worker config (if provided)
                 managed.coordinator_badge = workers[i].get("badge")
                 # Set agent type
@@ -864,9 +911,11 @@ def register_tools(mcp: FastMCP, ensure_connection) -> None:
 
         except ValueError as e:
             logger.error(f"Validation error in spawn_workers: {e}")
+            await _rollback_partial_spawn()
             return error_response(str(e))
         except Exception as e:
             logger.error(f"Failed to spawn workers: {e}")
+            await _rollback_partial_spawn()
             return error_response(
                 str(e),
                 hint=HINTS["iterm_connection"],

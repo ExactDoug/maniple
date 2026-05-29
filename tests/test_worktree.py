@@ -4,8 +4,10 @@ import subprocess
 
 import pytest
 
+import maniple_mcp.worktree as worktree_module
 from maniple_mcp.worktree import (
     WorktreeError,
+    _run_git,
     _safe_path_component,
     create_local_worktree,
     remove_orphan_dir_safely,
@@ -13,6 +15,21 @@ from maniple_mcp.worktree import (
     short_slug,
     worktree_has_changes,
 )
+
+
+class TestRunGitTimeout:
+    """C1: every git subprocess call carries a hard timeout."""
+
+    def test_timeout_raises_worktree_error(self, monkeypatch):
+        import subprocess
+
+        def fake_run(*args, **kwargs):
+            assert kwargs.get("timeout") is not None  # timeout must be passed
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+        monkeypatch.setattr(worktree_module.subprocess, "run", fake_run)
+        with pytest.raises(WorktreeError, match="timed out"):
+            _run_git(["git", "status"])
 
 
 def _init_repo(path):

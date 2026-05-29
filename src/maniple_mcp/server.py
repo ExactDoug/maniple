@@ -160,10 +160,12 @@ async def refresh_iterm_connection() -> ItermBackend:
     from iterm2.app import async_get_app
     from iterm2.connection import Connection
 
+    from .iterm_utils import _io
+
     logger.debug("Creating fresh iTerm2 connection...")
     try:
-        connection = await Connection.async_create()
-        app = await async_get_app(connection)
+        connection = await _io(Connection.async_create(), what="connection_create")
+        app = await _io(async_get_app(connection), what="get_app(refresh)")
         if app is None:
             raise RuntimeError("Could not get iTerm2 app")
         logger.debug("Fresh iTerm2 connection established")
@@ -195,13 +197,15 @@ async def ensure_connection(app_ctx: "AppContext") -> TerminalBackend:
 
     from iterm2.app import async_get_app
 
+    from .iterm_utils import _io
+
     connection = backend.connection
     app = backend.app
 
     # Test if connection is still alive by trying a simple operation
     try:
         # async_get_app is a lightweight call that tests the connection
-        refreshed_app = await async_get_app(connection)
+        refreshed_app = await _io(async_get_app(connection), what="get_app(ensure)")
         if refreshed_app is not None:
             if refreshed_app is not app:
                 backend = ItermBackend(connection, refreshed_app)
@@ -259,9 +263,15 @@ async def app_lifespan(
         else:
             # Connect to iTerm2
             logger.info("Connecting to iTerm2...")
+            from .iterm_utils import _io
+
             try:
-                connection = await Connection.async_create()
-                app = await async_get_app(connection)
+                connection = await _io(
+                    Connection.async_create(), what="connection_create(startup)"
+                )
+                app = await _io(
+                    async_get_app(connection), what="get_app(startup)"
+                )
                 if app is None:
                     raise RuntimeError("Could not get iTerm2 app")
                 logger.info("Connected to iTerm2 successfully")

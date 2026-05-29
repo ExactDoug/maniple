@@ -260,6 +260,20 @@ def test_tmux_session_name_fallback_for_none():
 
 
 @pytest.mark.asyncio
+async def test_run_tmux_timeout_raises_runtime_error(monkeypatch):
+    """C1: a hung tmux invocation must surface as a timeout, not block forever."""
+    backend = TmuxBackend()
+
+    def fake_run(*args, **kwargs):
+        assert kwargs.get("timeout") is not None  # inner subprocess carries timeout
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr("maniple_mcp.terminal_backends.tmux.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="timed out"):
+        await backend._run_tmux(["list-sessions"])
+
+
+@pytest.mark.asyncio
 async def test_start_agent_quotes_project_path_and_capture(monkeypatch):
     """
     MAN-SEC-001 (tmux side): the launch command must shell-quote project_path

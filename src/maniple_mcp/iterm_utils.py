@@ -5,6 +5,7 @@ Low-level primitives for iTerm2 terminal control, extracted and adapted
 from the original primitives.py for use in the MCP server.
 """
 
+import asyncio
 import logging
 import re
 import shlex
@@ -57,13 +58,35 @@ KEYS = {
 # Terminal Control
 # =============================================================================
 
+# Hard timeout (seconds) for a single low-level iTerm2 API call. The iTerm2
+# Python API talks to the app over a websocket; if the app becomes unresponsive
+# these awaits would otherwise block forever. 15s is well above normal latency
+# so it only fires on a genuine hang.
+ITERM_OP_TIMEOUT = 15.0
+
+
+async def _io(awaitable, *, what: str, timeout: float = ITERM_OP_TIMEOUT):
+    """
+    Await a single iTerm2 API call with a hard timeout.
+
+    Converts an unresponsive-iTerm2 hang into a clear RuntimeError instead of
+    blocking the caller indefinitely.
+    """
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(
+            f"iTerm2 {what} timed out after {timeout}s (iTerm2 unresponsive?)"
+        ) from e
+
+
 async def send_text(session: "ItermSession", text: str) -> None:
     """
     Send raw text to an iTerm2 session.
 
     Note: This sends characters as-is. Use send_key() for special keys.
     """
-    await session.async_send_text(text)
+    await _io(session.async_send_text(text), what="send_text")
 
 
 async def send_key(session: "ItermSession", key: str) -> None:
@@ -81,7 +104,7 @@ async def send_key(session: "ItermSession", key: str) -> None:
     key_code = KEYS.get(key.lower())
     if key_code is None:
         raise ValueError(f"Unknown key: {key}. Available: {list(KEYS.keys())}")
-    await session.async_send_text(key_code)
+    await _io(session.async_send_text(key_code), what="send_key")
 
 
 async def send_prompt(session: "ItermSession", text: str, submit: bool = True) -> None:
@@ -106,9 +129,7 @@ async def send_prompt(session: "ItermSession", text: str, submit: bool = True) -
         text: The text to send
         submit: If True, press Enter after sending text
     """
-    import asyncio
-
-    await session.async_send_text(text)
+    await _io(session.async_send_text(text), what="send_prompt")
     if submit:
         # Calculate delay based on text characteristics. Longer text and more
         # lines require more time for iTerm2's bracketed paste mode to process.
@@ -129,7 +150,7 @@ async def send_prompt(session: "ItermSession", text: str, submit: bool = True) -
             delay = 0.05
 
         await asyncio.sleep(delay)
-        await session.async_send_text(KEYS["enter"])
+        await _io(session.async_send_text(KEYS["enter"]), what="send_prompt(enter)")
 
 
 # Pre-Enter delay for Codex (in seconds).
@@ -160,14 +181,12 @@ async def send_prompt_for_agent(
         agent_type: The agent type identifier ("claude" or "codex")
         submit: If True, press Enter after sending text
     """
-    import asyncio
-
     if agent_type == "codex":
         # Codex: batch send text, but use longer pre-Enter delay.
         # For long/multi-line prompts, iTerm2's bracketed paste mode needs
         # time to complete before Enter is sent. Use the same delay
         # calculation as send_prompt() but ensure at least CODEX_PRE_ENTER_DELAY.
-        await session.async_send_text(text)
+        await _io(session.async_send_text(text), what="send_prompt_for_agent")
         if submit:
             # Calculate delay based on text length (same as send_prompt)
             line_count = text.count("\n")
@@ -183,7 +202,10 @@ async def send_prompt_for_agent(
                 char_count, line_count, delay
             )
             await asyncio.sleep(delay)
-            await session.async_send_text(KEYS["enter"])
+            await _io(
+                session.async_send_text(KEYS["enter"]),
+                what="send_prompt_for_agent(enter)",
+            )
     else:
         # Claude Code and other agents: use standard send_prompt
         await send_prompt(session, text, submit=submit)
@@ -199,7 +221,9 @@ async def read_screen(session: "ItermSession") -> list[str]:
     Returns:
         List of strings, one per line
     """
-    screen = await session.async_get_screen_contents()
+    screen = await _io(
+        session.async_get_screen_contents(), what="read_screen"
+    )
     return [screen.line(i).string for i in range(screen.number_of_lines)]
 
 
@@ -303,19 +327,18 @@ async def create_window(
     if profile_customizations is not None:
         kwargs["profile_customizations"] = profile_customizations
 
-    window = await Window.async_create(connection, **kwargs)
+    window = await _io(Window.async_create(connection, **kwargs), what="create_window")
 
     if window is None:
         raise RuntimeError("Failed to create iTerm2 window")
 
     # Exit fullscreen mode if the window opened in fullscreen
     # (can happen if user's default profile or iTerm2 settings use fullscreen)
-    is_fullscreen = await window.async_get_fullscreen()
+    is_fullscreen = await _io(window.async_get_fullscreen(), what="get_fullscreen")
     if is_fullscreen:
         logger.info("Window opened in fullscreen, exiting fullscreen mode")
-        await window.async_set_fullscreen(False)
+        await _io(window.async_set_fullscreen(False), what="set_fullscreen")
         # Give macOS time to animate out of fullscreen (animation is ~0.2s)
-        import asyncio
         await asyncio.sleep(0.2)
 
     # Set window frame to fill screen without triggering fullscreen mode
@@ -324,10 +347,10 @@ async def create_window(
         origin=Point(int(x), int(y)),
         size=Size(int(width), int(height)),
     )
-    await window.async_set_frame(frame)
+    await _io(window.async_set_frame(frame), what="set_frame")
 
     # Bring window to focus
-    await window.async_activate()
+    await _io(window.async_activate(), what="activate_window")
 
     return window
 
@@ -360,7 +383,7 @@ async def split_pane(
     if profile_customizations is not None:
         kwargs["profile_customizations"] = profile_customizations
 
-    return await session.async_split_pane(**kwargs)
+    return await _io(session.async_split_pane(**kwargs), what="split_pane")
 
 
 async def close_pane(session: "ItermSession", force: bool = False) -> bool:
@@ -377,7 +400,7 @@ async def close_pane(session: "ItermSession", force: bool = False) -> bool:
     Returns:
         True if the pane was closed successfully
     """
-    await session.async_close(force=force)
+    await _io(session.async_close(force=force), what="close_pane")
     return True
 
 
@@ -775,90 +798,103 @@ async def create_multi_pane_layout(
         profile=profile,
         profile_customizations=get_customization(first_pane),
     )
-    current_tab = window.current_tab
-    if current_tab is None:
-        raise RuntimeError("Failed to get current tab from new window")
-    initial_session = current_tab.current_session
-    if initial_session is None:
-        raise RuntimeError("Failed to get initial session from new window")
 
-    panes: dict[str, "ItermSession"] = {}
+    # If anything below fails mid-layout, close the window we just created so
+    # the partially-built layout (window + any panes already split) doesn't leak
+    # — the caller only receives panes on success and otherwise can't close them.
+    try:
+        current_tab = window.current_tab
+        if current_tab is None:
+            raise RuntimeError("Failed to get current tab from new window")
+        initial_session = current_tab.current_session
+        if initial_session is None:
+            raise RuntimeError("Failed to get initial session from new window")
 
-    if layout == "single":
-        # Single pane - no splitting needed, just use initial session
-        panes["main"] = initial_session
+        panes: dict[str, "ItermSession"] = {}
 
-    elif layout == "vertical":
-        # Split into left and right
-        panes["left"] = initial_session
-        panes["right"] = await split_pane(
-            initial_session,
-            vertical=True,
-            profile=profile,
-            profile_customizations=get_customization("right"),
-        )
+        if layout == "single":
+            # Single pane - no splitting needed, just use initial session
+            panes["main"] = initial_session
 
-    elif layout == "horizontal":
-        # Split into top and bottom
-        panes["top"] = initial_session
-        panes["bottom"] = await split_pane(
-            initial_session,
-            vertical=False,
-            profile=profile,
-            profile_customizations=get_customization("bottom"),
-        )
+        elif layout == "vertical":
+            # Split into left and right
+            panes["left"] = initial_session
+            panes["right"] = await split_pane(
+                initial_session,
+                vertical=True,
+                profile=profile,
+                profile_customizations=get_customization("right"),
+            )
 
-    elif layout == "quad":
-        # Create 2x2 grid:
-        # 1. Split vertically: left | right
-        # 2. Split left horizontally: top_left / bottom_left
-        # 3. Split right horizontally: top_right / bottom_right
-        left = initial_session
-        right = await split_pane(
-            left,
-            vertical=True,
-            profile=profile,
-            profile_customizations=get_customization("top_right"),
-        )
+        elif layout == "horizontal":
+            # Split into top and bottom
+            panes["top"] = initial_session
+            panes["bottom"] = await split_pane(
+                initial_session,
+                vertical=False,
+                profile=profile,
+                profile_customizations=get_customization("bottom"),
+            )
 
-        # Split the left column
-        panes["top_left"] = left
-        panes["bottom_left"] = await split_pane(
-            left,
-            vertical=False,
-            profile=profile,
-            profile_customizations=get_customization("bottom_left"),
-        )
+        elif layout == "quad":
+            # Create 2x2 grid:
+            # 1. Split vertically: left | right
+            # 2. Split left horizontally: top_left / bottom_left
+            # 3. Split right horizontally: top_right / bottom_right
+            left = initial_session
+            right = await split_pane(
+                left,
+                vertical=True,
+                profile=profile,
+                profile_customizations=get_customization("top_right"),
+            )
 
-        # Split the right column
-        panes["top_right"] = right
-        panes["bottom_right"] = await split_pane(
-            right,
-            vertical=False,
-            profile=profile,
-            profile_customizations=get_customization("bottom_right"),
-        )
+            # Split the left column
+            panes["top_left"] = left
+            panes["bottom_left"] = await split_pane(
+                left,
+                vertical=False,
+                profile=profile,
+                profile_customizations=get_customization("bottom_left"),
+            )
 
-    elif layout == "triple_vertical":
-        # Create 3 vertical panes: left | middle | right
-        # 1. Split initial into 2
-        # 2. Split right pane into 2 more
-        panes["left"] = initial_session
-        right_section = await split_pane(
-            initial_session,
-            vertical=True,
-            profile=profile,
-            profile_customizations=get_customization("middle"),
-        )
-        panes["middle"] = right_section
-        panes["right"] = await split_pane(
-            right_section,
-            vertical=True,
-            profile=profile,
-            profile_customizations=get_customization("right"),
-        )
+            # Split the right column
+            panes["top_right"] = right
+            panes["bottom_right"] = await split_pane(
+                right,
+                vertical=False,
+                profile=profile,
+                profile_customizations=get_customization("bottom_right"),
+            )
 
-    return panes
+        elif layout == "triple_vertical":
+            # Create 3 vertical panes: left | middle | right
+            # 1. Split initial into 2
+            # 2. Split right pane into 2 more
+            panes["left"] = initial_session
+            right_section = await split_pane(
+                initial_session,
+                vertical=True,
+                profile=profile,
+                profile_customizations=get_customization("middle"),
+            )
+            panes["middle"] = right_section
+            panes["right"] = await split_pane(
+                right_section,
+                vertical=True,
+                profile=profile,
+                profile_customizations=get_customization("right"),
+            )
+
+        return panes
+    except Exception:
+        try:
+            await _io(window.async_close(force=True), what="close_window(cleanup)")
+        except Exception as cleanup_exc:  # pragma: no cover - best effort
+            logger.warning(
+                f"Failed to close window during layout-failure cleanup: {cleanup_exc}"
+            )
+        raise
 
 
 async def create_multi_claude_layout(

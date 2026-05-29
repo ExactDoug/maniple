@@ -1,6 +1,7 @@
 """Tests for iterm_utils module."""
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -98,6 +99,55 @@ class TestClaudeCommandBuilding:
 
             assert "--dangerously-skip-permissions" in claude_cmd
             assert claude_cmd == "happy --dangerously-skip-permissions"
+
+
+class TestIoTimeout:
+    """C1: a single iTerm2 API call that hangs must surface as a timeout."""
+
+    @pytest.mark.asyncio
+    async def test_io_times_out(self):
+        import asyncio
+
+        import maniple_mcp.iterm_utils as iu
+
+        async def never_returns():
+            await asyncio.sleep(10)
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            await iu._io(never_returns(), what="unit-test", timeout=0.01)
+
+
+class TestLayoutCleanupOnFailure:
+    """Issue 2: a mid-layout failure must close the window so it doesn't leak."""
+
+    @pytest.mark.asyncio
+    async def test_window_closed_when_split_fails(self, monkeypatch):
+        import maniple_mcp.iterm_utils as iu
+
+        closed = {}
+
+        class FakeWindow:
+            def __init__(self):
+                self.current_tab = SimpleNamespace(current_session=object())
+
+            async def async_close(self, force=False):
+                closed["force"] = force
+
+        fake_window = FakeWindow()
+
+        async def fake_create_window(*args, **kwargs):
+            return fake_window
+
+        async def fake_split_pane(*args, **kwargs):
+            raise RuntimeError("split failed mid-layout")
+
+        monkeypatch.setattr(iu, "create_window", fake_create_window)
+        monkeypatch.setattr(iu, "split_pane", fake_split_pane)
+
+        with pytest.raises(RuntimeError, match="split failed"):
+            await iu.create_multi_pane_layout(connection=None, layout="vertical")
+
+        assert closed.get("force") is True  # window was force-closed on cleanup
 
 
 class TestStartAgentQuoting:
