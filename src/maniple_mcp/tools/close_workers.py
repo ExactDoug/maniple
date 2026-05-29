@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 from ..iterm_utils import CODEX_PRE_ENTER_DELAY
 from ..registry import SessionRegistry, SessionStatus
-from ..worktree import WorktreeError, remove_worktree
+from ..worktree import WorktreeError, remove_worktree, worktree_has_changes
 from ..utils import error_response, HINTS
 
 logger = logging.getLogger("maniple")
@@ -91,18 +91,34 @@ async def _close_single_worker(
             # TODO(rabsef-bicrym): Programmatically time these actions
             await asyncio.sleep(1.0)
 
-        # Clean up worktree if exists (keeps branch alive for cherry-picking)
+        # Clean up worktree if exists (keeps branch alive for cherry-picking).
+        # Guard against silent data loss: if the worktree has uncommitted or
+        # untracked changes, only remove it when force=True. Otherwise preserve
+        # it and report so the coordinator can salvage the work.
         worktree_cleaned = False
+        worktree_preserved = False
         if session.worktree_path and session.main_repo_path:
-            try:
-                remove_worktree(
-                    repo_path=session.main_repo_path,
-                    worktree_path=session.worktree_path,
+            has_changes = worktree_has_changes(session.worktree_path)
+            if has_changes and not force:
+                worktree_preserved = True
+                logger.warning(
+                    f"Worktree for {session_id} has uncommitted changes; "
+                    f"preserving it at {session.worktree_path}. "
+                    "Re-close with force=True to discard."
                 )
-                worktree_cleaned = True
-            except WorktreeError as e:
-                # Log but don't fail the close
-                logger.warning(f"Failed to clean up worktree for {session_id}: {e}")
+            else:
+                try:
+                    remove_worktree(
+                        repo_path=session.main_repo_path,
+                        worktree_path=session.worktree_path,
+                        # force only when the caller explicitly opted in AND the
+                        # tree is dirty; a clean tree removes without --force.
+                        force=force and has_changes,
+                    )
+                    worktree_cleaned = True
+                except WorktreeError as e:
+                    # Log but don't fail the close
+                    logger.warning(f"Failed to clean up worktree for {session_id}: {e}")
 
         # Close the terminal pane/window
         await backend.close_session(session.terminal_session, force=force)
@@ -110,10 +126,18 @@ async def _close_single_worker(
         # Remove from registry
         registry.remove(session_id)
 
-        return {
+        result = {
             "success": True,
             "worktree_cleaned": worktree_cleaned,
         }
+        if worktree_preserved:
+            result["worktree_preserved"] = True
+            result["worktree_path"] = str(session.worktree_path)
+            result["warning"] = (
+                "Worktree preserved due to uncommitted changes. "
+                "Salvage your work, then re-close with force=True to remove it."
+            )
+        return result
 
     except Exception as e:
         logger.error(f"Failed to close session {session_id}: {e}")
@@ -143,8 +167,10 @@ def register_tools(mcp: FastMCP) -> None:
 
         ⚠️ **NOTE: WORKTREE CLEANUP**
         Workers with worktrees commit to ephemeral branches. When closed:
-        - The worktree directory is removed
-        - The branch is KEPT for cherry-picking/merging
+        - The worktree directory is removed (the branch is KEPT)
+        - **If the worktree has uncommitted/untracked changes, it is PRESERVED**
+          unless force=True. The result then includes `worktree_preserved: True`
+          and `worktree_path` so you can salvage the work and re-close with force.
 
         **AFTER closing workers with worktrees:**
         1. Review commits on the worker's branch
@@ -154,7 +180,8 @@ def register_tools(mcp: FastMCP) -> None:
         Args:
             session_ids: List of session IDs to close (1 or more required).
                 Accepts internal IDs, terminal IDs, or worker names.
-            force: If True, force close even if sessions are busy
+            force: If True, force close even if sessions are busy AND discard
+                any uncommitted changes in worker worktrees (DESTRUCTIVE).
 
         Returns:
             Dict with:

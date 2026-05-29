@@ -5,8 +5,15 @@ Defines the interface that all CLI backends (Claude, Codex, etc.) must implement
 This abstraction allows claude-team to orchestrate different agent CLIs.
 """
 
+import re
+import shlex
 from abc import abstractmethod
 from typing import Literal, Protocol, runtime_checkable
+
+
+# A valid POSIX shell environment variable name. Used to reject env keys that
+# could inject shell syntax (keys cannot be quoted without breaking KEY=value).
+_VALID_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @runtime_checkable
@@ -119,19 +126,44 @@ class AgentCLI(Protocol):
 
         Returns:
             Complete command string ready for shell execution
+
+        Security:
+            Every interpolated value is neutralized against shell injection:
+
+            - The command override (``self.command()``) is re-tokenized with
+              ``shlex.split()`` and each token re-quoted. This preserves
+              legitimate multi-token overrides (e.g. ``"my-wrapper run"`` or a
+              quoted spaced path) while a malicious override such as
+              ``"claude; rm -rf ~"`` collapses into a harmless single command
+              name rather than injecting a second command.
+            - Each argument and each env value is escaped with ``shlex.quote()``;
+              benign flags pass through unchanged.
+            - Env var *names* are validated against ``_VALID_ENV_KEY`` (they
+              cannot be safely quoted in ``KEY=value`` form), rejecting any key
+              that could carry shell syntax.
+
+        Raises:
+            ValueError: If an environment variable name is not a valid shell
+                identifier.
         """
-        cmd = self.command()
+        cmd_parts = [shlex.quote(tok) for tok in shlex.split(self.command())]
         args = self.build_args(
             dangerously_skip_permissions=dangerously_skip_permissions,
             settings_file=settings_file if self.supports_settings_file() else None,
             plugin_dir=plugin_dir,
         )
-
-        if args:
-            cmd = f"{cmd} {' '.join(args)}"
+        cmd_parts.extend(shlex.quote(arg) for arg in args)
+        cmd = " ".join(cmd_parts)
 
         if env_vars:
-            env_exports = " ".join(f"{k}={v}" for k, v in env_vars.items())
+            for key in env_vars:
+                if not _VALID_ENV_KEY.match(key):
+                    raise ValueError(
+                        f"Invalid environment variable name: {key!r}"
+                    )
+            env_exports = " ".join(
+                f"{k}={shlex.quote(v)}" for k, v in env_vars.items()
+            )
             cmd = f"{env_exports} {cmd}"
 
         return cmd

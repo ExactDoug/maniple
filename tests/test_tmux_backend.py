@@ -257,3 +257,45 @@ def test_tmux_session_name_fallback_for_none():
     """Test that None project path produces fallback session name."""
     session = tmux_session_name_for_project(None)
     assert session == "maniple-project"
+
+
+@pytest.mark.asyncio
+async def test_start_agent_quotes_project_path_and_capture(monkeypatch):
+    """
+    MAN-SEC-001 (tmux side): the launch command must shell-quote project_path
+    and output_capture_path so they cannot inject shell syntax. This mirrors the
+    iTerm test in test_iterm_utils.py (backend parity).
+    """
+    from maniple_mcp.cli_backends import claude_cli
+
+    backend = TmuxBackend()
+    sent = {}
+
+    async def fake_shell_ready(handle, timeout_seconds=10.0):
+        return True
+
+    async def fake_agent_ready(handle, cli, timeout_seconds=30.0):
+        return True
+
+    async def fake_send_prompt(handle, cmd, submit=True):
+        sent["cmd"] = cmd
+
+    monkeypatch.setattr(backend, "_wait_for_shell_ready", fake_shell_ready)
+    monkeypatch.setattr(backend, "_wait_for_agent_ready", fake_agent_ready)
+    monkeypatch.setattr(backend, "send_prompt", fake_send_prompt)
+
+    session = TerminalSession("tmux", "%1", "%1")
+    evil_path = "/tmp/proj; touch pwned"
+    evil_capture = "/tmp/cap;rm -rf x"
+    await backend.start_agent_in_session(
+        handle=session,
+        cli=claude_cli,
+        project_path=evil_path,
+        output_capture_path=evil_capture,
+    )
+
+    cmd = sent["cmd"]
+    # Raw dangerous substrings must not appear unquoted.
+    assert "cd /tmp/proj; touch pwned &&" not in cmd
+    assert "'/tmp/proj; touch pwned'" in cmd
+    assert "'/tmp/cap;rm -rf x'" in cmd

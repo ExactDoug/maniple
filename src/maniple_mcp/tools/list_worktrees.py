@@ -5,7 +5,6 @@ Provides list_worktrees for managing claude-team created git worktrees.
 """
 
 import logging
-import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,6 +16,9 @@ if TYPE_CHECKING:
 
 from ..worktree import (
     list_local_worktrees,
+    remove_orphan_dir_safely,
+    worktree_has_changes,
+    WorktreeError,
     LOCAL_WORKTREE_DIR,
 )
 from ..utils import error_response, HINTS
@@ -41,7 +43,11 @@ def register_tools(mcp: FastMCP) -> None:
 
         Args:
             repo_path: Path to the repository to list worktrees for
-            remove_orphans: If True, remove worktrees that are not registered with git
+            remove_orphans: If True, remove orphaned worktrees that are not
+                registered with git. For safety, an orphan is removed ONLY if it
+                has a .git marker AND a clean working tree; orphans with
+                uncommitted/untracked changes are preserved and reported via
+                `removal_skipped`.
 
         Returns:
             Dict with:
@@ -54,9 +60,12 @@ def register_tools(mcp: FastMCP) -> None:
                     - commit: Current commit (if registered)
                     - registered: True if git knows about this worktree
                     - removed: True if orphan was removed (when remove_orphans=True)
+                    - removal_skipped: Reason string if an orphan was preserved
+                      ("uncommitted-changes" or "not-a-worktree")
                 - total: Total number of worktrees
                 - orphan_count: Number of orphaned worktrees
                 - removed_count: Number of orphans removed (when remove_orphans=True)
+                - skipped_count: Number of orphans preserved for safety
         """
         # Handle None values from MCP clients that send explicit null for omitted params
         remove_orphans = remove_orphans if remove_orphans is not None else False
@@ -69,11 +78,24 @@ def register_tools(mcp: FastMCP) -> None:
             )
 
         worktrees_dir = resolved_path / LOCAL_WORKTREE_DIR
+
+        # Refuse to remove orphans through a symlinked .worktrees root: rmtree
+        # would delete the symlink's target (outside the repo). Listing is still
+        # safe, so only block the destructive path.
+        if remove_orphans and worktrees_dir.is_symlink():
+            return error_response(
+                f".worktrees is a symlink; refusing to remove orphans through it: "
+                f"{worktrees_dir}",
+                hint="Remove or replace the .worktrees symlink with a real directory.",
+            )
+
         worktrees = list_local_worktrees(resolved_path)
 
         result_worktrees = []
         orphan_count = 0
         removed_count = 0
+
+        skipped_count = 0
 
         for wt in worktrees:
             wt_info = {
@@ -88,14 +110,62 @@ def register_tools(mcp: FastMCP) -> None:
             if not wt["registered"]:
                 orphan_count += 1
                 if remove_orphans:
-                    try:
-                        # Remove the orphaned directory
-                        shutil.rmtree(wt["path"])
-                        wt_info["removed"] = True
-                        removed_count += 1
-                        logger.info(f"Removed orphaned worktree: {wt['path']}")
-                    except Exception as e:
-                        logger.warning(f"Failed to remove orphaned worktree {wt['path']}: {e}")
+                    orphan_path = Path(wt["path"])
+                    # Safety guards before an irreversible delete:
+                    # 0) The resolved target MUST stay inside the repo. Anchored
+                    #    on resolved_path (a real path) this defeats a symlink
+                    #    swapped into .worktrees after the earlier is_symlink()
+                    #    check (TOCTOU) — rmtree can never escape the repo.
+                    # 1) Only delete things that are actually git worktrees
+                    #    (have a .git marker). Never rmtree an arbitrary dir.
+                    # 2) Never delete a worktree that has uncommitted/untracked
+                    #    changes — that work would be lost permanently.
+                    if not orphan_path.resolve().is_relative_to(resolved_path):
+                        wt_info["removal_skipped"] = "escapes-repo"
+                        skipped_count += 1
+                        logger.warning(
+                            f"Skipping orphan removal for {orphan_path}: "
+                            f"resolves outside repo {resolved_path} (symlink?)"
+                        )
+                    elif not (orphan_path / ".git").exists():
+                        wt_info["removal_skipped"] = "not-a-worktree"
+                        skipped_count += 1
+                        logger.warning(
+                            f"Skipping orphan removal for {orphan_path}: "
+                            "no .git marker (not a recognizable worktree)"
+                        )
+                    elif worktree_has_changes(orphan_path):
+                        wt_info["removal_skipped"] = "uncommitted-changes"
+                        skipped_count += 1
+                        logger.warning(
+                            f"Skipping orphan removal for {orphan_path}: "
+                            "has uncommitted or untracked changes"
+                        )
+                    else:
+                        try:
+                            # Remove the orphaned (clean) worktree directory using
+                            # an fd-pinned, symlink-refusing delete so a TOCTOU
+                            # parent-symlink swap cannot redirect rmtree outside
+                            # the repo.
+                            remove_orphan_dir_safely(worktrees_dir, wt["name"])
+                            wt_info["removed"] = True
+                            removed_count += 1
+                            logger.info(f"Removed orphaned worktree: {orphan_path}")
+                        except WorktreeError as e:
+                            wt_info["removal_skipped"] = "unsafe-path"
+                            skipped_count += 1
+                            logger.warning(
+                                f"Refusing unsafe orphan removal for {orphan_path}: {e}"
+                            )
+                        except Exception as e:
+                            # Keep the response contract consistent: a non-removed
+                            # orphan is always reflected via removal_skipped +
+                            # skipped_count, not just a log line.
+                            wt_info["removal_skipped"] = "error"
+                            skipped_count += 1
+                            logger.warning(
+                                f"Failed to remove orphaned worktree {orphan_path}: {e}"
+                            )
 
             result_worktrees.append(wt_info)
 
@@ -106,4 +176,5 @@ def register_tools(mcp: FastMCP) -> None:
             "total": len(worktrees),
             "orphan_count": orphan_count,
             "removed_count": removed_count,
+            "skipped_count": skipped_count,
         }
